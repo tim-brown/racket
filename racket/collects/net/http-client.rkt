@@ -56,7 +56,9 @@
        (http-conn-from hc)
        #t))
 
-(define (http-conn-open! hc host-bs #:ssl? [ssl? #f] #:port [port (if ssl? 443 80)])
+(define (http-conn-open! hc host-bs #:ssl? [ssl? #f]
+                         #:port [port (if ssl? 443 80)]
+                         #:tunnel-http-conn [tnl-hc #f])
   (http-conn-close! hc)
   (define host (->string host-bs))
   (define ssl-version (if (boolean? ssl?) 'auto ssl?))
@@ -66,8 +68,29 @@
            (set-http-conn-port-usual?! hc (= 443 port))
            (cond
              [(or ssl-available? (not win32-ssl-available?))
-              (set-http-conn-abandon-p! hc ssl-abandon-port)              
-              (ssl-connect host port ssl-version)]
+              (cond
+                [tnl-hc
+                   (printf "Using tunnel ~s~%" (list tnl-hc
+                                                     (http-conn-from tnl-hc)
+                                                     (http-conn-to tnl-hc)
+                                                     ))
+                   (set-http-conn-abandon-p! hc (http-conn-abandon-p tnl-hc))
+
+                   (thread (λ () (let loop ()
+                                   (displayln 'i-loop)
+                                   (copy-port (http-conn-from tnl-hc) (current-error-port))
+                                   (loop))))
+                   
+                   (file-stream-buffer-mode (http-conn-to tnl-hc) 'none)
+                   (file-stream-buffer-mode (http-conn-from tnl-hc) 'none)
+                   (ports->ssl-ports (http-conn-from tnl-hc)
+                                     (http-conn-to tnl-hc)
+                                     #:mode 'connect
+                                     #:encrypt 'auto
+                                     #:close-original? #f)]
+                [else
+                 (set-http-conn-abandon-p! hc ssl-abandon-port)              
+                 (ssl-connect host port ssl-version)])]
              [else
               (set-http-conn-abandon-p! hc win32-ssl-abandon-port)
               (win32-ssl-connect host port ssl-version)])]
@@ -79,14 +102,15 @@
   (set-http-conn-host! hc host)
   (set-http-conn-port! hc port)
 
-  ;; (define-values (log-i log-o) (make-pipe))
-  ;; (thread (λ () (copy-port log-i to (current-error-port))))
+  (define-values (log-i log-o) (make-pipe))
+  (thread (λ () (copy-port log-i to (current-error-port))))
 
   (set-http-conn-to! hc to)
   (set-http-conn-from! hc from))
 
 (define (http-conn-close! hc)
   (match-define (http-conn host port port-usual? to from abandon) hc)
+  (printf "http-conn-close! ~s~%" (list http-conn host port port-usual? to from abandon))
   (set-http-conn-host! hc #f)
   (when to
     (close-output-port to)
@@ -116,6 +140,7 @@
                          #:content-decode [decodes '(gzip)]
                          #:data [data #f])
   (match-define (http-conn host port port-usual? to from _) hc)
+  (printf "http-conn-send! ~s~%" (list http-conn host port port-usual? to from))
   (fprintf to "~a ~a HTTP/~a\r\n" method-bss url-bs version-bs)
   (unless (regexp-member #rx"^(?i:Host:) +.+$" headers-bs)
     (fprintf to "Host: ~a\r\n" 
@@ -176,7 +201,11 @@
   (define-values (in out) (make-pipe PIPE-SIZE))
   (thread
    (λ ()
-     (copy-bytes (http-conn-from hc) out count)
+     ;; XXX This loop is new!
+     (let loop ()
+       (copy-bytes (http-conn-from hc) out count)
+       (when (= count +inf.0)
+         (unless (port-closed? (http-conn-from hc)) (loop))))
      (when close?
        (http-conn-close! hc))
      (close-output-port out)))
@@ -221,9 +250,13 @@
 
 ;; Derived
 
-(define (http-conn-open host-bs #:ssl? [ssl? #f] #:port [port (if ssl? 443 80)])
+(define (http-conn-open host-bs #:ssl? [ssl? #f] #:port [port (if ssl? 443 80)]
+                        #:tunnel-http-conn [tnl-hc #f])
   (define hc (make-http-conn))
-  (http-conn-open! hc host-bs #:ssl? ssl? #:port port)
+  (when tnl-hc
+    (displayln (http-conn-to tnl-hc))
+    (displayln (http-conn-from tnl-hc)))
+  (http-conn-open! hc host-bs #:ssl? ssl? #:port port #:tunnel-http-conn tnl-hc)
   hc)
 
 (define (http-conn-recv! hc
@@ -332,7 +365,8 @@
   [http-conn-open!
    (->* (http-conn? (or/c bytes? string?))
         (#:ssl? (or/c boolean? ssl-client-context? symbol?)
-                #:port (between/c 1 65535))
+                #:port (between/c 1 65535)
+                #:tunnel-http-conn (or/c false/c http-conn?))
         void?)]
   [http-conn-close!
    (-> http-conn? void?)]
@@ -352,7 +386,8 @@
   [http-conn-open
    (->* ((or/c bytes? string?))
         (#:ssl? (or/c boolean? ssl-client-context? symbol?)
-                #:port (between/c 1 65535))
+                #:port (between/c 1 65535)
+                #:tunnel-http-conn (or/c false/c http-conn?))
         http-conn?)]
   [http-conn-recv!
    (->* (http-conn-live?)

@@ -26,21 +26,24 @@
 (define (env->c-p-s-entries envar)
   (match (getenv envar)
     [(or #f "") null]
-    [(app string->url
-          (url (and scheme "http") #f host port _ (list) (list) #f))
+    [(app string->url (url (and scheme (or "http" "https")) #f host port _ (list) (list) #f))
      (list (list scheme host port))]
     [inv (log-net/url-info "~s contained invalid proxy URL format: ~s"
                            envar inv)
          null]))
 
 (define current-proxy-servers
-  (make-parameter (env->c-p-s-entries "PLT_HTTP_PROXY")
+  (make-parameter (append
+                   (env->c-p-s-entries "PLT_HTTP_PROXY")
+                   (env->c-p-s-entries "PLT_HTTPS_PROXY"))
                   (lambda (v)
                     (unless (and (list? v)
                                  (andmap (lambda (v)
                                            (and (list? v)
                                                 (= 3 (length v))
-                                                (equal? (car v) "http")
+                                                (or
+                                                 (equal? (car v) "http")
+                                                 (equal? (car v) "https"))
                                                 (string? (car v))
                                                 (exact-integer? (caddr v))
                                                 (<= 1 (caddr v) 65535)))
@@ -105,11 +108,28 @@
                        (caddr proxy)
                        (or (url-port url) (url->default-port url)))]
         [host (if proxy (cadr proxy) (url-host url))])
+
+    (define tunnel-http-conn
+      (and proxy
+           (equal? "https" (url-scheme url))
+           (http://CONNECT-http-conn url #f null)))
+    
+    (when tunnel-http-conn
+      (printf "[0]live:~s~%" (hc:http-conn-live? tunnel-http-conn))
+      (define-values (status headers raw-response-port)
+        (hc:http-conn-recv! tunnel-http-conn #:close? #f #:content-decode '()))
+      ;(displayln (list status headers raw-response-port))
+      ;(displayln (read-line raw-response-port))
+      ;(define purity (purify-port raw-response-port))
+      ;(displayln purity)
+      (printf "live:~s~%" (hc:http-conn-live? tunnel-http-conn)))
+    
     (hc:http-conn-open host
                        #:port port-number
                        #:ssl? (if (equal? "https" (url-scheme url))
                                 (current-https-protocol)
-                                #f))))
+                                #f)
+                       #:tunnel-http-conn tunnel-http-conn)))
 
 ;; http://getpost-impure-port : bool x url x union (str, #f) x list (str)
 ;;                               -> hc
@@ -358,7 +378,7 @@
 (define (http://method-impure-port method url data strings)
   (let* ([method (case method
                    [(get) "GET"] [(post) "POST"] [(head) "HEAD"]
-                   [(put) "PUT"] [(delete) "DELETE"] [(options) "OPTIONS"] 
+                   [(put) "PUT"] [(delete) "DELETE"] [(options) "OPTIONS"]
                    [else (url-error "unsupported method: ~a" method)])]
          [proxy (proxy-server-for (url-scheme url) (url-host url))]
          [hc (make-ports url proxy)]
@@ -376,6 +396,42 @@
                         #:content-decode '()
                         #:data data)
     (http-conn-impure-port hc)))
+
+;; http://metod-impure-port : symbol x url x union (str, #f) x list (str) -> in-port
+(define (http://CONNECT-http-conn remote-url data strings)
+  (let* ([method "CONNECT"]
+         [proxy (or
+                 (proxy-server-for (url-scheme remote-url) (url-host remote-url))
+                 (error (url-error "CONNECT needs a proxy (or is it vice versa?)")))]
+         [hc (make-ports (struct-copy url remote-url [scheme "http"]) proxy)]
+         [access-string (format "~a:~a" (url-host remote-url) (url-port remote-url))])
+    (displayln access-string)
+    (hc:http-conn-send! hc access-string
+                        #:method method
+                        #:headers strings
+                        #:close? #f
+                        #:content-decode '()
+                        #:data data)
+    hc))
+
+(define (http-conn-CONNECT-pure-port hc)
+  ;(define-values (in out) (make-pipe 4096))
+  (define-values (status headers response-port)
+    (hc:http-conn-recv! hc #:close? #f #:content-decode '()))
+  #;(fprintf out "~a\r\n" status)
+  #;(for ([h (in-list headers)])
+    (fprintf out "~a\r\n" h))
+  #;(fprintf out "\r\n")
+  #;(thread
+   (λ ()
+     (let loop ()
+       (displayln 'loop)
+       (copy-port response-port out)
+       (flush-output out)
+       #;(unless (port-closed? response-port) (loop)))
+     (close-output-port out)))
+  #;in
+  response-port)
 
 (provide (all-from-out "url-string.rkt"))
 
